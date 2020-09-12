@@ -4,8 +4,16 @@
 #define _GNU_SOURCE
 #endif
 
+#include "config.h"
+
+#ifdef HAVE_FUSE3
+#ifndef FUSE_USE_VERSION
+#define FUSE_USE_VERSION 30
+#endif
+#else
 #ifndef FUSE_USE_VERSION
 #define FUSE_USE_VERSION 26
+#endif
 #endif
 
 #define _FILE_OFFSET_BITS 64
@@ -29,7 +37,6 @@
 #include <unistd.h>
 
 #include "bindings.h"
-#include "config.h"
 #include "macro.h"
 #include "memory_utils.h"
 #include "utils.h"
@@ -188,7 +195,7 @@ bool wait_for_sock(int sock, int timeout)
 
 	epfd = epoll_create(1);
 	if (epfd < 0)
-		return log_error(false, "%s\n", "Failed to create epoll socket: %m");
+		return log_error(false, "%m - Failed to create epoll socket");
 
 	ev.events = POLLIN_SET;
 	ev.data.fd = sock;

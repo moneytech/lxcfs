@@ -4,8 +4,16 @@
 #define _GNU_SOURCE
 #endif
 
+#include "config.h"
+
+#ifdef HAVE_FUSE3
+#ifndef FUSE_USE_VERSION
+#define FUSE_USE_VERSION 30
+#endif
+#else
 #ifndef FUSE_USE_VERSION
 #define FUSE_USE_VERSION 26
+#endif
 #endif
 
 #define _FILE_OFFSET_BITS 64
@@ -40,11 +48,11 @@
 #include <sys/vfs.h>
 
 #include "bindings.h"
-#include "config.h"
 #include "cgroup_fuse.h"
 #include "cgroups/cgroup.h"
 #include "cgroups/cgroup_utils.h"
 #include "cpuset_parse.h"
+#include "lxcfs_fuse_compat.h"
 #include "memory_utils.h"
 #include "proc_loadavg.h"
 #include "proc_cpuview.h"
@@ -95,7 +103,7 @@ __lxcfs_fuse_ops int proc_getattr(const char *path, struct stat *sb)
 	    strcmp(path, "/proc/diskstats")	== 0 ||
 	    strcmp(path, "/proc/swaps")		== 0 ||
 	    strcmp(path, "/proc/loadavg")	== 0) {
-		sb->st_size = 0;
+		sb->st_size = 4096;
 		sb->st_mode = S_IFREG | 00444;
 		sb->st_nlink = 1;
 		return 0;
@@ -108,15 +116,15 @@ __lxcfs_fuse_ops int proc_readdir(const char *path, void *buf,
 				  fuse_fill_dir_t filler, off_t offset,
 				  struct fuse_file_info *fi)
 {
-	if (filler(buf, ".",		NULL, 0) != 0 ||
-	    filler(buf, "..",		NULL, 0) != 0 ||
-	    filler(buf, "cpuinfo",	NULL, 0) != 0 ||
-	    filler(buf, "meminfo",	NULL, 0) != 0 ||
-	    filler(buf, "stat",		NULL, 0) != 0 ||
-	    filler(buf, "uptime",	NULL, 0) != 0 ||
-	    filler(buf, "diskstats",	NULL, 0) != 0 ||
-	    filler(buf, "swaps",	NULL, 0) != 0 ||
-	    filler(buf, "loadavg",	NULL, 0) != 0)
+	if (DIR_FILLER(filler, buf, ".",		NULL, 0) != 0 ||
+	    DIR_FILLER(filler, buf, "..",		NULL, 0) != 0 ||
+	    DIR_FILLER(filler, buf, "cpuinfo",	NULL, 0) != 0 ||
+	    DIR_FILLER(filler, buf, "meminfo",	NULL, 0) != 0 ||
+	    DIR_FILLER(filler, buf, "stat",		NULL, 0) != 0 ||
+	    DIR_FILLER(filler, buf, "uptime",	NULL, 0) != 0 ||
+	    DIR_FILLER(filler, buf, "diskstats",	NULL, 0) != 0 ||
+	    DIR_FILLER(filler, buf, "swaps",	NULL, 0) != 0 ||
+	    DIR_FILLER(filler, buf, "loadavg",	NULL, 0) != 0)
 		return -EINVAL;
 
 	return 0;
@@ -213,6 +221,68 @@ static uint64_t get_memlimit(const char *cgroup, bool swap)
 	return memlimit;
 }
 
+/*
+ * This function taken from glibc-2.32, as POSIX dirname("/some-dir") will
+ * return "/some-dir" as opposed to "/", which breaks `get_min_memlimit()`
+ */
+static char *gnu_dirname(char *path)
+{
+	static const char dot[] = ".";
+	char *last_slash;
+
+	/* Find last '/'.  */
+	last_slash = path != NULL ? strrchr(path, '/') : NULL;
+
+	if (last_slash != NULL && last_slash != path && last_slash[1] == '\0') {
+		/* Determine whether all remaining characters are slashes.  */
+		char *runp;
+
+		for (runp = last_slash; runp != path; --runp)
+			if (runp[-1] != '/')
+				break;
+
+		/* The '/' is the last character, we have to look further.  */
+		if (runp != path)
+			last_slash = memrchr(path, '/', runp - path);
+	}
+
+	if (last_slash != NULL) {
+		/* Determine whether all remaining characters are slashes.  */
+		char *runp;
+
+		for (runp = last_slash; runp != path; --runp)
+			if (runp[-1] != '/')
+				break;
+
+		/* Terminate the path.  */
+		if (runp == path) {
+			/*
+			 * The last slash is the first character in the string.
+			 * We have to return "/".  As a special case we have to
+			 * return "//" if there are exactly two slashes at the
+			 * beginning of the string.  See XBD 4.10 Path Name
+			 * Resolution for more information
+			 */
+			if (last_slash == path + 1)
+				++last_slash;
+			else
+				last_slash = path + 1;
+		} else
+			last_slash = runp;
+
+		last_slash[0] = '\0';
+	} else {
+		/*
+		 * This assignment is ill-designed but the XPG specs require to
+		 * return a string containing "." in any case no directory part
+		 * is found and so a static and constant string is required.
+		 */
+		path = (char *)dot;
+	}
+
+	return path;
+}
+
 static uint64_t get_min_memlimit(const char *cgroup, bool swap)
 {
 	__do_free char *copy = NULL;
@@ -224,10 +294,14 @@ static uint64_t get_min_memlimit(const char *cgroup, bool swap)
 
 	retlimit = get_memlimit(copy, swap);
 
-	while (strcmp(copy, "/") != 0) {
+	/*
+	 * If the cgroup doesn't start with / (probably won't happen), dirname()
+	 * will terminate with "" instead of "/"
+	 */
+	while (*copy && strcmp(copy, "/") != 0) {
 		char *it = copy;
 
-		it = dirname(it);
+		it = gnu_dirname(it);
 		memlimit = get_memlimit(it, swap);
 		if (memlimit > 0 && memlimit < retlimit)
 			retlimit = memlimit;
@@ -374,6 +448,27 @@ static void get_blkio_io_value(char *str, unsigned major, unsigned minor,
 	}
 }
 
+struct lxcfs_diskstats {
+	unsigned int major;		/*  1 - major number */
+	unsigned int minor;		/*  2 - minor mumber */
+	char dev_name[72];		/*  3 - device name */
+	uint64_t read;			/*  4 - reads completed successfully */
+	uint64_t read_merged;		/*  5 - reads merged */
+	uint64_t read_sectors;		/*  6 - sectors read */
+	uint64_t read_ticks;		/*  7 - time spent reading (ms) */
+	uint64_t write;			/*  8 - writes completed */
+	uint64_t write_merged;		/*  9 - writes merged */
+	uint64_t write_sectors; 	/* 10 - sectors written */
+	uint64_t write_ticks;		/* 11 - time spent writing (ms) */
+	uint64_t ios_pgr;		/* 12 - I/Os currently in progress */
+	uint64_t total_ticks;		/* 13 - time spent doing I/Os (ms) */
+	uint64_t rq_ticks;		/* 14 - weighted time spent doing I/Os (ms) */
+	uint64_t discard;		/* 15 - discards completed successfully	(4.18+) */
+	uint64_t discard_merged;	/* 16 - discards merged			(4.18+) */
+	uint64_t discard_sectors;	/* 17 - sectors discarded		(4.18+) */
+	uint64_t discard_ticks;		/* 18 - time spent discarding		(4.18+) */
+};
+
 static int proc_diskstats_read(char *buf, size_t size, off_t offset,
 			       struct fuse_file_info *fi)
 {
@@ -385,19 +480,15 @@ static int proc_diskstats_read(char *buf, size_t size, off_t offset,
 	__do_fclose FILE *f = NULL;
 	struct fuse_context *fc = fuse_get_context();
 	struct file_info *d = INTTYPE_TO_PTR(fi->fh);
-	uint64_t read = 0, write = 0;
-	uint64_t read_merged = 0, write_merged = 0;
-	uint64_t read_sectors = 0, write_sectors = 0;
-	uint64_t read_ticks = 0, write_ticks = 0;
-	uint64_t ios_pgr = 0, tot_ticks = 0, rq_ticks = 0;
-	uint64_t rd_svctm = 0, wr_svctm = 0, rd_wait = 0, wr_wait = 0;
+	struct lxcfs_diskstats stats = {};
+	/* helper fields */
+	uint64_t read_service_time, write_service_time, discard_service_time, read_wait_time,
+	    write_wait_time, discard_wait_time;
 	char *cache = d->buf;
 	size_t cache_size = d->buflen;
 	size_t linelen = 0, total_len = 0;
-	unsigned int major = 0, minor = 0;
 	int i = 0;
 	int ret;
-	char dev_name[72];
 
 	if (offset) {
 		int left;
@@ -462,39 +553,69 @@ static int proc_diskstats_read(char *buf, size_t size, off_t offset,
 		ssize_t l;
 		char lbuf[256];
 
-		i = sscanf(line, "%u %u %71s", &major, &minor, dev_name);
+		i = sscanf(line, "%u %u %71s", &stats.major, &stats.minor, stats.dev_name);
 		if (i != 3)
 			continue;
 
-		get_blkio_io_value(io_serviced_str, major, minor, "Read", &read);
-		get_blkio_io_value(io_serviced_str, major, minor, "Write", &write);
-		get_blkio_io_value(io_merged_str, major, minor, "Read", &read_merged);
-		get_blkio_io_value(io_merged_str, major, minor, "Write", &write_merged);
-		get_blkio_io_value(io_service_bytes_str, major, minor, "Read", &read_sectors);
-		read_sectors = read_sectors/512;
-		get_blkio_io_value(io_service_bytes_str, major, minor, "Write", &write_sectors);
-		write_sectors = write_sectors/512;
+		get_blkio_io_value(io_serviced_str, stats.major, stats.minor, "Read", &stats.read);
+		get_blkio_io_value(io_serviced_str, stats.major, stats.minor, "Write", &stats.write);
+		get_blkio_io_value(io_serviced_str, stats.major, stats.minor, "Discard", &stats.discard);
 
-		get_blkio_io_value(io_service_time_str, major, minor, "Read", &rd_svctm);
-		rd_svctm = rd_svctm/1000000;
-		get_blkio_io_value(io_wait_time_str, major, minor, "Read", &rd_wait);
-		rd_wait = rd_wait/1000000;
-		read_ticks = rd_svctm + rd_wait;
+		get_blkio_io_value(io_merged_str, stats.major, stats.minor, "Read", &stats.read_merged);
+		get_blkio_io_value(io_merged_str, stats.major, stats.minor, "Write", &stats.write_merged);
+		get_blkio_io_value(io_merged_str, stats.major, stats.minor, "Discard", &stats.discard_merged);
 
-		get_blkio_io_value(io_service_time_str, major, minor, "Write", &wr_svctm);
-		wr_svctm =  wr_svctm/1000000;
-		get_blkio_io_value(io_wait_time_str, major, minor, "Write", &wr_wait);
-		wr_wait =  wr_wait/1000000;
-		write_ticks = wr_svctm + wr_wait;
+		get_blkio_io_value(io_service_bytes_str, stats.major, stats.minor, "Read", &stats.read_sectors);
+		stats.read_sectors = stats.read_sectors / 512;
+		get_blkio_io_value(io_service_bytes_str, stats.major, stats.minor, "Write", &stats.write_sectors);
+		stats.write_sectors = stats.write_sectors / 512;
+		get_blkio_io_value(io_service_bytes_str, stats.major, stats.minor, "Discard", &stats.discard_sectors);
+		stats.discard_sectors = stats.discard_sectors / 512;
 
-		get_blkio_io_value(io_service_time_str, major, minor, "Total", &tot_ticks);
-		tot_ticks =  tot_ticks/1000000;
+		get_blkio_io_value(io_service_time_str, stats.major, stats.minor, "Read", &read_service_time);
+		read_service_time = read_service_time / 1000000;
+		get_blkio_io_value(io_wait_time_str, stats.major, stats.minor, "Read", &read_wait_time);
+		read_wait_time = read_wait_time / 1000000;
+		stats.read_ticks = read_service_time + read_wait_time;
+
+		get_blkio_io_value(io_service_time_str, stats.major, stats.minor, "Write", &write_service_time);
+		write_service_time = write_service_time / 1000000;
+		get_blkio_io_value(io_wait_time_str, stats.major, stats.minor, "Write", &write_wait_time);
+		write_wait_time = write_wait_time / 1000000;
+		stats.write_ticks = write_service_time + write_wait_time;
+
+		get_blkio_io_value(io_service_time_str, stats.major, stats.minor, "Discard", &discard_service_time);
+		discard_service_time = discard_service_time / 1000000;
+		get_blkio_io_value(io_wait_time_str, stats.major, stats.minor, "Discard", &discard_wait_time);
+		discard_wait_time = discard_wait_time / 1000000;
+		stats.discard_ticks = discard_service_time + discard_wait_time;
+
+		get_blkio_io_value(io_service_time_str, stats.major, stats.minor, "Total", &stats.total_ticks);
+		stats.total_ticks = stats.total_ticks / 1000000;
 
 		memset(lbuf, 0, 256);
-		if (read || write || read_merged || write_merged || read_sectors || write_sectors || read_ticks || write_ticks)
-			snprintf(lbuf, 256, "%u       %u %s %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu\n",
-				major, minor, dev_name, read, read_merged, read_sectors, read_ticks,
-				write, write_merged, write_sectors, write_ticks, ios_pgr, tot_ticks, rq_ticks);
+		if (stats.read || stats.write || stats.read_merged || stats.write_merged ||
+		    stats.read_sectors || stats.write_sectors || stats.read_ticks ||
+		    stats.write_ticks || stats.ios_pgr || stats.total_ticks || stats.rq_ticks ||
+		    stats.discard_merged || stats.discard_sectors || stats.discard_ticks)
+			snprintf(lbuf, 256, "%u       %u %s %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu\n",
+				stats.major,
+				stats.minor,
+				stats.dev_name,
+				stats.read,
+				stats.read_merged,
+				stats.read_sectors,
+				stats.read_ticks,
+				stats.write,
+				stats.write_merged,
+				stats.write_sectors,
+				stats.write_ticks,
+				stats.ios_pgr,
+				stats.total_ticks,
+				stats.rq_ticks,
+				stats.discard_merged,
+				stats.discard_sectors,
+				stats.discard_ticks);
 		else
 			continue;
 
